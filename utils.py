@@ -71,8 +71,8 @@ def parse_cfg():
                 layer_type = lines[i].rstrip()[1:-1]  # extract layer type info
                 block = {"layer_type": layer_type}  # new dictionary for each new block
                 count = 1  # count the line for each block
-                while i+count < len(lines) and lines[i+count][0] != '[':  # parse new line until the block ends
-                    if lines[i+count][0] not in ['#', '\n']:  # skip commented or white lines
+                while i + count < len(lines) and lines[i + count][0] != '[':  # parse new line until the block ends
+                    if lines[i + count][0] not in ['#', '\n']:  # skip commented or white lines
                         attr, val = lines[i + count].rstrip().split('=')
                         attr, val = cast_type(attr.rstrip(), val)
                         block[attr] = val
@@ -83,21 +83,68 @@ def parse_cfg():
     return config
 
 
+class EmptyLayer(nn.Module):
+    """
+    Dummy layer useful for route and shortcut layers
+    """
+    def __init__(self):
+        super(EmptyLayer, self).__init__()
+
+
+class YoloLayer(nn.Module):
+    def __init__(self, anchors):
+        super(YoloLayer, self).__init__()
+        self.anchors = anchors
+
+
 def create_modules(config):
     module_list = nn.ModuleList()
+    hyperparams = config[0]
+    prev_filters = hyperparams['channels']  # RGB images --> first layer has 3 filters
+    output_filters = [prev_filters]  # store the output filters for each layer
     for idx, block in enumerate(config[1:]):
+        mod = nn.Sequential()
         if block['layer_type'] == 'convolutional':
-            pass
-        if block['layer_type'] == 'upsample':
-            pass
-        if block['layer_type'] == 'route':
-            pass
-        if block['layer_type'] == 'shortcut':
-            pass
-        if block['layer_type'] == 'yolo':
-            pass
+            filters = block['filters']
+            pad = (filters-1)//2 if block["pad"] else 0
+            conv = nn.Conv2d(in_channels=prev_filters,
+                             out_channels=filters,
+                             kernel_size=block["size"],
+                             stride=block["stride"],
+                             padding=pad,
+                             bias=block.get('batch_normalize', 0))
+            mod.add_module(f"conv_{idx}", conv)
+
+            if 'batch_normalize' in block:
+                mod.add_module(f"batch_norm_{idx}", nn.BatchNorm2d(block["filters"]))
+
+            if block["activation"] == 'leaky':
+                mod.add_module(f"leaky_{idx}", nn.LeakyReLU(0.1, inplace=True))
+
+        elif block['layer_type'] == 'upsample':
+            mod.add_module(f'upsample_{idx}', nn.Upsample(scale_factor=2, mode='bilinear'))
+
+        elif block['layer_type'] == 'route':
+            filters: int = sum([output_filters[i] for i in list(block['layers'])])
+            mod.add_module(f'route_{idx}', EmptyLayer())  # its just a placeholder.
+
+        elif block['layer_type'] == 'shortcut':
+            mod.add_module(f'shortcut_{idx}', EmptyLayer())
+
+        elif block['layer_type'] == 'yolo':
+            mod.add_module(f'yolo_{idx}', YoloLayer(block['anchors']))
+        else:
+            print("Unknown layer type")
+            exit(0)
+
+        module_list.append(mod)
+        prev_filters = filters
+        output_filters.append(filters)
+
+    return hyperparams, module_list
 
 
 config = parse_cfg()
-create_modules(config)
+print(create_modules(config)[1])
+
 print("DONE")
