@@ -1,8 +1,36 @@
 import requests
 import os
 import torch.nn as nn
+import cv2
+import numpy as np
+import torch
+
 
 URL_CFG = "https://raw.githubusercontent.com/pjreddie/darknet/master/cfg/yolov3.cfg"
+
+
+class EmptyLayer(nn.Module):
+    """
+    Dummy layer useful for route and shortcut layers
+    """
+    def __init__(self):
+        super(EmptyLayer, self).__init__()
+
+
+class YoloLayer(nn.Module):
+    def __init__(self, anchors):
+        super(YoloLayer, self).__init__()
+        self.anchors = anchors
+
+    def forward(self, x):
+        pass
+
+
+def get_test_image(shape):
+    img = cv2.imread("dog-cycle-car.png")
+    img = cv2.resize(img, shape).transpose((2, 0, 1))[np.newaxis, ...]  # H W C --> B C H W
+    img = torch.from_numpy(img/255.0).float()
+    return img
 
 
 def download_cfg(dest_path):
@@ -55,12 +83,11 @@ def cast_type(attr, val):
     return attr, val
 
 
-def parse_cfg():
+def parse_cfg(dest_path):
     """
     Parse the official configuration file 'yolov3.cfg'.
     :return: a list of dictionaries that represent each layer configuration
     """
-    dest_path = os.getcwd() + "/yolov3.cfg"
     config = []
     if "yolov3.cfg" not in os.listdir(os.getcwd()):
         download_cfg(dest_path)
@@ -83,46 +110,31 @@ def parse_cfg():
     return config
 
 
-class EmptyLayer(nn.Module):
-    """
-    Dummy layer useful for route and shortcut layers
-    """
-    def __init__(self):
-        super(EmptyLayer, self).__init__()
-
-
-class YoloLayer(nn.Module):
-    def __init__(self, anchors):
-        super(YoloLayer, self).__init__()
-        self.anchors = anchors
-
-
 def create_modules(config):
     module_list = nn.ModuleList()
-    hyperparams = config[0]
-    prev_filters = hyperparams['channels']  # RGB images --> first layer has 3 filters
+    prev_filters = 3  # RGB images --> first layer has 3 filters
     output_filters = [prev_filters]  # store the output filters for each layer
-    for idx, block in enumerate(config[1:]):
+    for idx, block in enumerate(config):
         mod = nn.Sequential()
         if block['layer_type'] == 'convolutional':
             filters = block['filters']
-            pad = (filters-1)//2 if block["pad"] else 0
+            pad = (block['size']-1)//2 if block['pad'] else 0
             conv = nn.Conv2d(in_channels=prev_filters,
                              out_channels=filters,
-                             kernel_size=block["size"],
-                             stride=block["stride"],
+                             kernel_size=block['size'],
+                             stride=block['stride'],
                              padding=pad,
                              bias=block.get('batch_normalize', 0))
             mod.add_module(f"conv_{idx}", conv)
 
             if 'batch_normalize' in block:
-                mod.add_module(f"batch_norm_{idx}", nn.BatchNorm2d(block["filters"]))
+                mod.add_module(f"batch_norm_{idx}", nn.BatchNorm2d(filters))
 
             if block["activation"] == 'leaky':
                 mod.add_module(f"leaky_{idx}", nn.LeakyReLU(0.1, inplace=True))
 
         elif block['layer_type'] == 'upsample':
-            mod.add_module(f'upsample_{idx}', nn.Upsample(scale_factor=2, mode='bilinear'))
+            mod.add_module(f'upsample_{idx}', nn.Upsample(scale_factor=block["stride"], mode='bilinear'))
 
         elif block['layer_type'] == 'route':
             filters: int = sum([output_filters[i] for i in list(block['layers'])])
@@ -141,10 +153,4 @@ def create_modules(config):
         prev_filters = filters
         output_filters.append(filters)
 
-    return hyperparams, module_list
-
-
-config = parse_cfg()
-print(create_modules(config)[1])
-
-print("DONE")
+    return module_list
