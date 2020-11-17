@@ -1,10 +1,10 @@
 import requests
 import os
 import torch.nn as nn
+import torch.nn.functional as F
 import cv2
 import numpy as np
 import torch
-
 
 URL_CFG = "https://raw.githubusercontent.com/pjreddie/darknet/master/cfg/yolov3.cfg"
 
@@ -13,23 +13,95 @@ class EmptyLayer(nn.Module):
     """
     Dummy layer useful for route and shortcut layers
     """
+
     def __init__(self):
         super(EmptyLayer, self).__init__()
 
 
+def rescale_anchors(anchors, img_dim, grid_x):
+    """
+    The anchors are computed w.r.t. the input image (eg 416*416) then
+    we need to rescale them in the current feature map size (e.g. 13 * 13)
+    """
+    num_anchors = len(anchors)
+    FloatTensor = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor
+    stride = img_dim[0] / grid_x  # how much the input image's dims have been reduced at this point
+    anchors = FloatTensor(np.asarray(anchors) / stride)
+    anchors_w = anchors[..., 0].view(1, num_anchors, 1, 1)
+    anchors_h = anchors[..., 1].view(1, num_anchors, 1, 1)
+    return anchors_w, anchors_h
+
+
+def create_grid(size_x):
+    c_x = torch.ones((1, 1, size_x, size_x)) * torch.arange(size_x)
+    c_y = (torch.ones((1, 1, size_x, size_x)) * torch.arange(size_x)).permute(0, 1, 3, 2)
+    return c_x, c_y
+
+
 class YoloLayer(nn.Module):
-    def __init__(self, anchors):
+    def __init__(self, anchors, num_classes, img_dim):
+        """
+        The anchors are the pre-defined bounding boxes, computed with k-means algorithm.
+        """
         super(YoloLayer, self).__init__()
         self.anchors = anchors
+        self.img_dim = img_dim
+        self.num_classes = num_classes
 
     def forward(self, x):
-        pass
+        """
+        layer 82 --> x.shape = [batch, 255, 13, 13]
+        layer 94 --> x.shape = [batch, 255, 26, 26]
+        layer 106 --> x.shape = [batch, 255, 52, 52]
 
+        The input channels are 255, in the form:
+        C_in = bbox_num * (bbox_coords_pred + obj_score + classes_scores) = 3 * (4 + 1 + 80)
+        where: bbox_coords_pred = (t_x, t_y, t_w, t_h) <-- offset w.r.t. the anchor boxes
+
+        The output channels will be 255, in the form:
+        C_out = bbox_num * (bbox_coords + obj_score + classes_scores) = 3 * (4 + 1 + 80)
+
+        The C_out bbox_coords are computed as follow:
+        b_x = sigmoid(t_x) + c_x
+        b_y = sigmoid(t_y) + c_y
+        b_w = p_w * e^t_w
+        b_h = p_h * e^t_h
+        - c_x and c_y are the top left coordinate of the cells in the input grid
+        - p_w and p_h are the scaled anchors width and height
+        """
+        batch_size = x.shape[0]
+        num_anchors = len(self.anchors)
+        num_classes = self.num_classes
+        grid_x, grid_y = x.shape[2:]
+
+        x = x.view(batch_size, num_anchors, num_classes + 5, grid_x, grid_y)  # x.shape = [batch, 3, 85, 13, 13]
+
+        x = x.permute(0, 1, 3, 4, 2)  # x.shape = [batch, 3, 13, 13, 85]
+
+        anchors_w, anchors_h = rescale_anchors(self.anchors, self.img_dim, grid_x)
+
+        c_x, c_y = create_grid(grid_x)
+
+        b_x = torch.sigmoid(x[..., 0]) + c_x  # shape = [1, 3, 13, 13]
+        b_y = torch.sigmoid(x[..., 1]) + c_y  # shape = [1, 3, 13, 13]
+        b_w = torch.exp(x[..., 2]) * anchors_w  # shape = [1, 3, 13, 13]
+        b_h = torch.exp(x[..., 3]) * anchors_h  # shape = [1, 3, 13, 13]
+        obj_score = x[..., 4]  # shape = [1, 3, 13, 13]
+        class_score = x[..., 5:]  # shape = [1, 3, 13, 13, 80]
+
+        output = torch.cat((b_x.unsqueeze(2),
+                            b_y.unsqueeze(2),
+                            b_w.unsqueeze(2),
+                            b_h.unsqueeze(2),
+                            obj_score.unsqueeze(2),
+                            class_score.permute(0, 1, 4, 2, 3)),
+                           dim=2).view(batch_size, num_anchors * (5 + num_classes), grid_x, grid_y)
+        print(output.shape)
 
 def get_test_image(shape):
     img = cv2.imread("dog-cycle-car.png")
     img = cv2.resize(img, shape).transpose((2, 0, 1))[np.newaxis, ...]  # H W C --> B C H W
-    img = torch.from_numpy(img/255.0).float()
+    img = torch.from_numpy(img / 255.0).float()
     return img
 
 
@@ -110,15 +182,15 @@ def parse_cfg(dest_path):
     return config
 
 
-def create_modules(config):
+def create_modules(config, hyperparams):
     module_list = nn.ModuleList()
-    prev_filters = 3  # RGB images --> first layer has 3 filters
+    prev_filters = hyperparams['channels']  # RGB images --> first layer has 3 filters
     output_filters = [prev_filters]  # store the output filters for each layer
     for idx, block in enumerate(config):
         mod = nn.Sequential()
         if block['layer_type'] == 'convolutional':
             filters = block['filters']
-            pad = (block['size']-1)//2 if block['pad'] else 0
+            pad = (block['size'] - 1) // 2 if block['pad'] else 0
             conv = nn.Conv2d(in_channels=prev_filters,
                              out_channels=filters,
                              kernel_size=block['size'],
@@ -144,7 +216,9 @@ def create_modules(config):
             mod.add_module(f'shortcut_{idx}', EmptyLayer())
 
         elif block['layer_type'] == 'yolo':
-            mod.add_module(f'yolo_{idx}', YoloLayer(block['anchors']))
+            img_dim = (hyperparams['width'], hyperparams['height'])
+            anchors = [block['anchors'][i] for i in block['mask']]
+            mod.add_module(f'yolo_{idx}', YoloLayer(anchors, block['classes'], img_dim))
         else:
             print("Unknown layer type")
             exit(0)
