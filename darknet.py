@@ -10,7 +10,8 @@ class Darknet(nn.Module):
         super(Darknet, self).__init__()
         self.config = config
         self.hyperparams = self.config.pop(0)
-        self.module_list = utils.create_modules(self.config)
+        self.module_list = utils.create_modules(self.config, self.hyperparams)
+        # print(self.module_list)
 
     def forward(self, x):
         config = self.config
@@ -18,14 +19,22 @@ class Darknet(nn.Module):
         layers_output = []
         for idx, mod in enumerate(module_list):
             layer_type = config[idx]['layer_type']
-            if layer_type in ['convolutional', 'upsample', 'yolo']:
+            if layer_type in ['convolutional', 'upsample']:
+                if layer_type == 'yolo':
+                    print(idx)
                 x = mod(x)
+
             elif layer_type == 'route':
                 # concatenate specific layers outputs in depth dimension
                 x = torch.cat([layers_output[i] for i in config[idx]['layers']], dim=1)
+
             elif layer_type == 'shortcut':
                 # sum specific layers outputs
                 x = layers_output[-1] + layers_output[config[idx]['from']]
+
+            elif layer_type == 'yolo':
+                x = mod(x)
+
             layers_output.append(x)
         return x
 
