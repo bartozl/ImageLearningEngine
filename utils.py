@@ -1,108 +1,59 @@
 import requests
 import os
 import torch.nn as nn
-import torch.nn.functional as F
 import cv2
 import numpy as np
 import torch
+from models import EmptyLayer, YoloLayer
+
 
 URL_CFG = "https://raw.githubusercontent.com/pjreddie/darknet/master/cfg/yolov3.cfg"
+URL_WEIGHTS = "https://pjreddie.com/media/files/yolov3.weights"
 
 
-class EmptyLayer(nn.Module):
-    """
-    Dummy layer useful for route and shortcut layers
-    """
+def get_pretrained_weights(config, module_list):
+    dest_path = f'{os.getcwd()}/yolov3.weights'
+    if not os.path.exists(dest_path):
+        print(f"downloading {URL_WEIGHTS}")
+        r = requests.get(URL_CFG, allow_redirects=True)
+        with open(dest_path, 'wb') as f:
+            f.write(r.content)
+        print(f"saved in {dest_path}")
 
-    def __init__(self):
-        super(EmptyLayer, self).__init__()
+    with open(dest_path, 'rb') as f:
+        header = np.fromfile(f, dtype=np.int32, count=5)
+        pret_weights = np.fromfile(f, dtype=np.float32)
 
+    idx = 0
+    for o, (block, mod) in enumerate(zip(config, module_list)):
+        if block['layer_type'] == 'convolutional':
+            conv = mod[0]
+            if 'batch_normalize' in block:
+                bn = mod[1]
 
-def rescale_anchors(anchors, img_dim, grid_x):
-    """
-    The anchors are computed w.r.t. the input image (eg 416*416) then
-    we need to rescale them in the current feature map size (e.g. 13 * 13)
-    """
-    num_anchors = len(anchors)
-    FloatTensor = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor
-    stride = img_dim[0] / grid_x  # how much the input image's dims have been reduced at this point
-    anchors = FloatTensor(np.asarray(anchors) / stride)
-    anchors_w = anchors[..., 0].view(1, num_anchors, 1, 1)
-    anchors_h = anchors[..., 1].view(1, num_anchors, 1, 1)
-    return anchors_w, anchors_h
+                bn_b = torch.from_numpy(pret_weights[idx:(idx + bn.bias.numel())]).view(bn.bias.shape)
+                idx += bn.bias.numel()
 
+                bn_w = torch.from_numpy(pret_weights[idx:(idx + bn.weight.numel())]).view(bn.weight.shape)
+                idx += bn.weight.numel()
 
-def create_grid(size_x):
-    c_x = torch.ones((1, 1, size_x, size_x)) * torch.arange(size_x)
-    c_y = (torch.ones((1, 1, size_x, size_x)) * torch.arange(size_x)).permute(0, 1, 3, 2)
-    return c_x, c_y
+                bn_rm = torch.from_numpy(pret_weights[idx:(idx + bn.running_mean.numel())]).view(bn.running_mean.shape)
+                idx += bn.running_mean.numel()
 
+                bn_rv = torch.from_numpy(pret_weights[idx:(idx + bn.running_var.numel())]).view(bn.running_var.shape)
+                idx += bn.running_var.numel()
 
-class YoloLayer(nn.Module):
-    def __init__(self, anchors, num_classes, img_dim):
-        """
-        The anchors are the pre-defined bounding boxes, computed with k-means algorithm.
-        """
-        super(YoloLayer, self).__init__()
-        self.anchors = anchors
-        self.img_dim = img_dim
-        self.num_classes = num_classes
-
-    def forward(self, x):
-        """
-        layer 82 --> x.shape = [batch, 255, 13, 13]
-        layer 94 --> x.shape = [batch, 255, 26, 26]
-        layer 106 --> x.shape = [batch, 255, 52, 52]
-
-        The input channels are 255, in the form:
-        C_in = bbox_num * (bbox_coords_pred + obj_score + classes_scores) = 3 * (4 + 1 + 80)
-        where: bbox_coords_pred = (t_x, t_y, t_w, t_h) <-- offset w.r.t. the anchor boxes
-
-        The output channels will be 255, in the form:
-        C_out = bbox_num * (bbox_coords + obj_score + classes_scores) = 3 * (4 + 1 + 80)
-
-        The C_out bbox_coords are computed as follow:
-        b_x = sigmoid(t_x) + c_x
-        b_y = sigmoid(t_y) + c_y
-        b_w = p_w * e^t_w
-        b_h = p_h * e^t_h
-        - c_x and c_y are the top left coordinate of the cells in the input grid
-        - p_w and p_h are the scaled anchors width and height
-        """
-        batch_size = x.shape[0]
-        num_anchors = len(self.anchors)
-        num_classes = self.num_classes
-        grid_x, grid_y = x.shape[2:]
-
-        x = x.view(batch_size, num_anchors, num_classes + 5, grid_x, grid_y)  # x.shape = [batch, 3, 85, 13, 13]
-
-        x = x.permute(0, 1, 3, 4, 2)  # x.shape = [batch, 3, 13, 13, 85]
-
-        anchors_w, anchors_h = rescale_anchors(self.anchors, self.img_dim, grid_x)
-
-        c_x, c_y = create_grid(grid_x)
-
-        b_x = torch.sigmoid(x[..., 0]) + c_x  # shape = [1, 3, 13, 13]
-        b_y = torch.sigmoid(x[..., 1]) + c_y  # shape = [1, 3, 13, 13]
-        b_w = torch.exp(x[..., 2]) * anchors_w  # shape = [1, 3, 13, 13]
-        b_h = torch.exp(x[..., 3]) * anchors_h  # shape = [1, 3, 13, 13]
-        obj_score = x[..., 4]  # shape = [1, 3, 13, 13]
-        class_score = x[..., 5:]  # shape = [1, 3, 13, 13, 80]
-
-        output = torch.cat((b_x.unsqueeze(2),
-                            b_y.unsqueeze(2),
-                            b_w.unsqueeze(2),
-                            b_h.unsqueeze(2),
-                            obj_score.unsqueeze(2),
-                            class_score.permute(0, 1, 4, 2, 3)),
-                           dim=2).view(batch_size, num_anchors * (5 + num_classes), grid_x, grid_y)
-        print(output.shape)
-
-def get_test_image(shape):
-    img = cv2.imread("dog-cycle-car.png")
-    img = cv2.resize(img, shape).transpose((2, 0, 1))[np.newaxis, ...]  # H W C --> B C H W
-    img = torch.from_numpy(img / 255.0).float()
-    return img
+                bn.bias.data.copy_(bn_b)
+                bn.weight.data.copy_(bn_w)
+                bn.running_mean.data.copy_(bn_rm)
+                bn.running_var.data.copy_(bn_rv)
+            else:
+                bias = torch.from_numpy(pret_weights[idx:(idx + conv.bias.numel())]).view(conv.bias.shape)
+                conv.bias.data.copy_(bias)
+                idx += conv.bias.numel()
+            weights = torch.from_numpy(pret_weights[idx:(idx + conv.weight.numel())]).view(conv.weight.shape)
+            conv.weight.data.copy_(weights)
+            idx += conv.weight.numel()
 
 
 def download_cfg(dest_path):
@@ -115,6 +66,32 @@ def download_cfg(dest_path):
     with open(dest_path, 'wb') as f:
         f.write(r.content)
     print(f"saved in {dest_path}")
+
+
+def rescale_anchors(anchors, stride):
+    """
+    The anchors are computed w.r.t. the input image (eg 416*416) then
+    we need to rescale them in the current feature map size (e.g. 13 * 13)
+    """
+    num_anchors = len(anchors)
+    FloatTensor = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor
+    anchors = FloatTensor(np.asarray(anchors) / stride)
+    anchors_w = anchors[..., 0].view(1, num_anchors, 1, 1)
+    anchors_h = anchors[..., 1].view(1, num_anchors, 1, 1)
+    return anchors_w, anchors_h
+
+
+def create_grid(size_x):
+    c_x = torch.ones((1, 1, size_x, size_x)) * torch.arange(size_x)
+    c_y = (torch.ones((1, 1, size_x, size_x)) * torch.arange(size_x)).permute(0, 1, 3, 2)
+    return c_x, c_y
+
+
+def get_test_image(shape):
+    img = cv2.imread("dog-cycle-car.png")
+    img = cv2.resize(img, shape).transpose((2, 0, 1))[np.newaxis, ...]  # H W C --> B C H W
+    img = torch.from_numpy(img / 255.0).float()
+    return img
 
 
 def cast_type(attr, val):
@@ -196,7 +173,7 @@ def create_modules(config, hyperparams):
                              kernel_size=block['size'],
                              stride=block['stride'],
                              padding=pad,
-                             bias=block.get('batch_normalize', 0))
+                             bias=not int(block.get('batch_normalize', 0)))
             mod.add_module(f"conv_{idx}", conv)
 
             if 'batch_normalize' in block:
