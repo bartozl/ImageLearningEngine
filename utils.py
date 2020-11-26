@@ -1,11 +1,14 @@
 import requests
 import os
 import torch.nn as nn
-import cv2
+from PIL import Image
 import numpy as np
 import torch
 from models import EmptyLayer, YoloLayer
-
+import torchvision.transforms as transforms
+import torch.nn.functional as F
+import cv2
+import matplotlib.patches as patches
 
 URL_CFG = "https://raw.githubusercontent.com/pjreddie/darknet/master/cfg/yolov3.cfg"
 URL_WEIGHTS = "https://pjreddie.com/media/files/yolov3.weights"
@@ -87,11 +90,87 @@ def create_grid(size_x):
     return c_x, c_y
 
 
-def get_test_image(shape):
-    img = cv2.imread("dog-cycle-car.png")
-    img = cv2.resize(img, shape).transpose((2, 0, 1))[np.newaxis, ...]  # H W C --> B C H W
-    img = torch.from_numpy(img / 255.0).float()
+def center2diag(bboxes):
+    c_x, c_y, w, h = bboxes[..., 0], bboxes[..., 1], bboxes[..., 2], bboxes[..., 3]
+    bboxes[..., 0] = c_x - w / 2  # x_1
+    bboxes[..., 1] = c_y - h / 2  # y_1
+    bboxes[..., 2] = c_x + w / 2  # x_2
+    bboxes[..., 3] = c_y + h / 2  # y_2
+    return bboxes
+
+
+def get_pad(shape):
+    h, w = shape
+    pad = [0, 0, 0, 0]  # left, right, top, bottom
+    q = [abs(h - w) // 2] * 2
+    if h > w:
+        pad[:2] = q
+    elif h < w:
+        pad[2:] = q
+    return pad
+
+
+def add_pad(img, resize=None):
+    pad = get_pad(img.shape[1:])
+    img = F.pad(img, pad=pad, mode='constant', value=0).unsqueeze(0)
+    if resize is not None:
+        img = F.interpolate(img, size=resize, mode="nearest")
     return img
+
+
+def scale_bboxes(bboxes, orig_shape, curr_shape):
+    curr_shape = torch.tensor(curr_shape)
+    orig_shape = torch.tensor(orig_shape)
+    scale = torch.min(curr_shape / orig_shape)
+
+    # compute the pad ratio in the (resized) current image
+    scaled_pad = torch.tensor(get_pad(orig_shape)) * scale  # [left, right, top, bottom]
+    scaled_pad = [torch.sum(scaled_pad[2:]), torch.sum(scaled_pad[:2])]  # [width, height]
+
+    # compute the measure of the unpadded current image
+    curr_unpadded = [curr_shape[0] - scaled_pad[1], curr_shape[1] - scaled_pad[0]]
+
+    # rescale the current bboxes according to the new size:
+
+    for i in range(4):
+        idx = (i + 1) % 2  # 0 = width ; 1 = height
+        bboxes[:, i] = ((bboxes[:, i] - scaled_pad[idx] // 2) / curr_unpadded[idx]) * orig_shape[i % 2]
+
+    return bboxes
+
+
+def get_input(cap, resize=None):
+    ret, frame = cap.read()
+    img_orig = transforms.ToTensor()(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    # img = transforms.ToTensor()(cv2.imread(img_path))
+    img_curr = add_pad(img_orig, resize=resize)
+    return img_curr, img_orig
+
+
+def get_labels(dir_path='labels.names'):
+    with open(dir_path) as f:
+        names = f.readlines()
+    labels = {i: names[i].rstrip() for i in range(len(names))}
+    return labels
+
+
+def preprocess_nms(pred, conf_thresh=0.8):
+    # pred.shape = [10647, 85] = [n_boxes, c_x | c_y | w | h | obj_score | classes(80)]
+    pred = pred[pred[:, 4] > conf_thresh]
+    pred_new = torch.empty(pred.shape[0], 7)  # [n_boxes, c_x | c_y | w | h | score | class_idx | class_score]
+    # transform bboxes coordinates: xywh --> x1y1x2y2
+    c_x, c_y, w, h = pred[:, 0], pred[:, 1], pred[:, 2], pred[:, 3]
+    x1, y1 = c_x - w / 2, c_y - h / 2
+    x2, y2 = c_x + w / 2, c_y + h / 2
+    bboxes = torch.cat((x1.unsqueeze(-1), y1.unsqueeze(-1), x2.unsqueeze(-1), y2.unsqueeze(-1)), dim=-1)
+    pred_new[:, :4] = bboxes
+
+    # score = obj_score * max(class_score)
+    max_class, idx_class = torch.max(pred[:, 5:], dim=-1)
+    pred_new[:, 4] = pred[:, 4] * max_class
+    pred_new[:, 5] = idx_class
+    pred_new[:, 6] = max_class
+    return pred_new
 
 
 def cast_type(attr, val):
@@ -121,7 +200,7 @@ def cast_type(attr, val):
     # list of list attributes
     elif attr == 'anchors':
         val = (val[1:].split(',  '))
-        val2 = []  # TODO can I do it more pythonic? XD
+        val2 = []
         for x in val:
             val2.append([int(v) for v in x.split(',')])
         val = val2
@@ -177,10 +256,10 @@ def create_modules(config, hyperparams):
             mod.add_module(f"conv_{idx}", conv)
 
             if 'batch_normalize' in block:
-                mod.add_module(f"batch_norm_{idx}", nn.BatchNorm2d(filters))
+                mod.add_module(f"batch_norm_{idx}", nn.BatchNorm2d(filters, momentum=0.9))
 
             if block["activation"] == 'leaky':
-                mod.add_module(f"leaky_{idx}", nn.LeakyReLU(0.1, inplace=True))
+                mod.add_module(f"leaky_{idx}", nn.LeakyReLU(0.1))
 
         elif block['layer_type'] == 'upsample':
             mod.add_module(f'upsample_{idx}', nn.Upsample(scale_factor=block["stride"], mode='bilinear'))
@@ -205,3 +284,19 @@ def create_modules(config, hyperparams):
         output_filters.append(filters)
 
     return module_list
+
+
+def create_output_image(ax, detection, labels):
+    for x1, y1, x2, y2, score, class_label, class_score in detection:
+        box_w = x2 - x1
+        box_h = y2 - y1
+        bbox = patches.Rectangle((x1, y1), box_w, box_h, linewidth=2, alpha=0.8, edgecolor='red', facecolor="none")
+        # Add the bbox to the plot
+        ax.add_patch(bbox)
+        ax.text(x1 + 3,
+                y1 + 3,
+                s=f'{class_score:.4f} {labels[int(class_label)]}',
+                horizontalalignment='left',
+                verticalalignment='top',
+                bbox=dict(facecolor='red', alpha=0.4, edgecolor='red', boxstyle='round,pad=0.2')
+                )

@@ -45,7 +45,6 @@ class YoloLayer(nn.Module):
         - c_x and c_y are the top left coordinate of the cells in the input grid
         - p_w and p_h are the scaled anchors width and height
         """
-
         batch_size = x.shape[0]
         num_anchors = len(self.anchors)
         num_classes = self.num_classes
@@ -55,11 +54,9 @@ class YoloLayer(nn.Module):
         x = x.view(batch_size, num_anchors, num_classes + 5, grid_x, grid_y)  # x.shape = [batch, 3, 85, 13, 13]
 
         x = x.permute(0, 1, 3, 4, 2)  # x.shape = [batch, 3, 13, 13, 85]
-
         anchors_w, anchors_h = utils.rescale_anchors(self.anchors, stride)
 
         c_x, c_y = utils.create_grid(grid_x)
-
         b_x = torch.sigmoid(x[..., 0]) + c_x  # shape = [1, 3, 13, 13]
         b_y = torch.sigmoid(x[..., 1]) + c_y
         b_w = torch.exp(x[..., 2]) * anchors_w  # shape = [1, 3, 13, 13]
@@ -74,13 +71,9 @@ class YoloLayer(nn.Module):
         obj_score = obj_score.view(batch_size, -1).unsqueeze(-1)
         class_score = class_score.view(batch_size, -1, num_classes)  # class_score.shape = [1, 507, 80]
 
-        output = torch.cat([b_x * stride,
-                            b_y * stride,
-                            b_w * stride,
-                            b_h * stride,
-                            obj_score,
-                            class_score],
-                           dim=-1)  # [1, 507, 85]
+        output = torch.cat([b_x, b_y, b_w, b_h, obj_score, class_score], dim=-1)  # [1, 507, 85]
+
+        output[..., :4] *= stride
 
         return output
 
@@ -97,17 +90,14 @@ class Darknet(nn.Module):
         config = self.config
         module_list = self.module_list
         layers_output, yolo_outputs = [], []
+
         for idx, mod in enumerate(module_list):
             layer_type = config[idx]['layer_type']
             if layer_type in ['convolutional', 'upsample']:
-                if layer_type == 'yolo':
-                    print(idx)
                 x = mod(x.to(device))
-
             elif layer_type == 'route':
                 # concatenate specific layers outputs in depth dimension
                 x = torch.cat([layers_output[i] for i in config[idx]['layers']], dim=1).to(device)
-
             elif layer_type == 'shortcut':
                 # sum specific layers outputs
                 x = (layers_output[-1] + layers_output[config[idx]['from']]).to(device)
