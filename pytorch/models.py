@@ -14,12 +14,12 @@ class EmptyLayer(nn.Module):
 
 class YoloLayer(nn.Module):
     def __init__(self, anchors, num_classes, img_dim):
+        super(YoloLayer, self).__init__()
         """
         The anchors are the pre-defined bounding boxes, computed with k-means algorithm.
         Instead of computing the bounding box from scratch, we adjust the dimension
         of this already know bounding boxes
         """
-        super(YoloLayer, self).__init__()
         self.anchors = anchors
         self.img_dim = img_dim
         self.num_classes = num_classes
